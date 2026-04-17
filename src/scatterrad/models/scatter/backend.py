@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from scatterrad.models.scatter.frontend import _second_order_features, _N_GLCM_STATS
 
@@ -37,9 +38,13 @@ class ScatterBackend(nn.Module):
                ↓
         Conv3d(C_in → hidden, k=3, pad=1) + BN + ReLU
                ↓
-        Conv3d(hidden → hidden, k=3, pad=1) + BN + ReLU
+        MaxPool3d(k=2, s=2)
                ↓
-        Masked global average pool (inside ROI mask) → (B, hidden)
+        Conv3d(hidden → 2*hidden, k=3, s=2, pad=1) + BN + ReLU
+               ↓
+        MaxPool3d(k=2, s=2)
+               ↓
+        Masked global average pool (inside ROI mask) → (B, 2*hidden)
                ↓
         LayerNorm → Linear(hidden → hidden) → ReLU
 
@@ -59,24 +64,35 @@ class ScatterBackend(nn.Module):
         self.hidden_channels = hidden_channels
         self.second_order = second_order
         self.glcm_bins = glcm_bins
+        self.conv_out_channels = hidden_channels * 2
 
         self.conv = nn.Sequential(
             nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(hidden_channels),
             nn.ReLU(inplace=True),
-            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(hidden_channels),
+            nn.MaxPool3d(kernel_size=2, stride=2),
+            nn.Conv3d(hidden_channels, self.conv_out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm3d(self.conv_out_channels),
             nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=2, stride=2),
         )
         glcm_dim = in_channels * _N_GLCM_STATS if second_order else 0
         self.mlp = nn.Sequential(
-            nn.LayerNorm(hidden_channels + glcm_dim),
-            nn.Linear(hidden_channels + glcm_dim, hidden_channels),
+            nn.LayerNorm(self.conv_out_channels + glcm_dim),
+            nn.Linear(self.conv_out_channels + glcm_dim, hidden_channels),
             nn.ReLU(inplace=True),
         )
 
+    def _downsample_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        mask = F.max_pool3d(mask, kernel_size=2, stride=2)
+        mask = F.max_pool3d(mask, kernel_size=3, stride=2, padding=1)
+        mask = F.max_pool3d(mask, kernel_size=2, stride=2)
+        return mask
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        feat = masked_gap(self.conv(x), mask)  # (B, hidden)
+        conv_feat = self.conv(x)
+        pooled_mask = self._downsample_mask(mask).to(dtype=conv_feat.dtype)
+        feat = masked_gap(conv_feat, pooled_mask)  # (B, 2*hidden)
         if self.second_order:
             glcm = _batch_second_order(x, mask, n_bins=self.glcm_bins)
             feat = torch.cat([feat, glcm], dim=1)

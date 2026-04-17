@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 from torch import amp
 from torch import nn
+from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -29,7 +30,7 @@ from scatterrad.config import (
 from scatterrad.data import ClassBalancedSampler, ScatterRadDataset, scatter_collate_fn
 from scatterrad.evaluation import compute_metrics
 from scatterrad.models.scatter.model import ScatterRadModel
-from scatterrad.models.scatter.scatter_cache import load_cached_scatter, precompute_and_cache
+from scatterrad.models.scatter.scatter_cache import load_cached_scatter
 from scatterrad.paths import ScatterRadPaths
 from scatterrad.preprocessing.crop import read_crop
 from scatterrad.utils import resolve_num_workers
@@ -41,11 +42,11 @@ def _load_splits(path: Path) -> list[dict[str, list[str]]]:
     return json.loads(path.read_text())["folds"]
 
 
-def _loss_fn(spec_type: TargetType, num_classes: int | None, pos_weight: torch.Tensor | None = None) -> nn.Module:
+def _loss_fn(spec_type: TargetType, num_classes: int | None) -> nn.Module:
     if spec_type is TargetType.REGRESSION:
         return nn.SmoothL1Loss()
     if (num_classes or 2) == 2:
-        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        return nn.BCEWithLogitsLoss()
     return nn.CrossEntropyLoss()
 
 
@@ -73,6 +74,74 @@ def _load_state_dict_from_checkpoint(payload: Any) -> dict[str, torch.Tensor]:
     if isinstance(payload, dict):
         return payload
     raise ValueError("Unsupported checkpoint format: expected dict or {'state_dict': ...}")
+
+
+def _dataset_cache_keys(ds: ScatterRadDataset) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    if ds.scope is TargetScope.PER_LABEL:
+        for basename, label_id in ds.samples:
+            keys.add((basename, int(label_id)))
+        return keys
+    for basename in ds.samples:
+        for label_id in ds.labels:
+            if ds.paths.crop_path(basename, label_id).exists():
+                keys.add((basename, int(label_id)))
+    return keys
+
+
+def _evaluate_model(
+    *,
+    model: ScatterRadModel,
+    loader: DataLoader,
+    spec_type: TargetType,
+    num_classes: int | None,
+    loss_fn: nn.Module,
+    device: torch.device,
+    amp_enabled: bool,
+) -> dict[str, Any]:
+    model.eval()
+    y_true: list[float] = []
+    y_pred: list[float] = []
+    y_proba: list[np.ndarray] = []
+    attn_values: list[np.ndarray] = []
+    losses: list[float] = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            if "scatter" in batch and torch.is_tensor(batch["scatter"]) and not amp_enabled:
+                batch["scatter"] = batch["scatter"].float()
+            with amp.autocast("cuda", enabled=amp_enabled):
+                out = model(batch)
+                logits = out["logits"]
+                target = batch["target"]
+                if spec_type is TargetType.REGRESSION:
+                    val_loss = loss_fn(logits.squeeze(-1), target.float())
+                elif (num_classes or 2) == 2:
+                    val_loss = loss_fn(logits.squeeze(-1), target.float())
+                else:
+                    val_loss = loss_fn(logits, target.long())
+            losses.append(float(val_loss))
+            pred, proba = _predict_from_logits(logits, spec_type, num_classes)
+            y_true.extend(target.cpu().numpy().tolist())
+            y_pred.extend(pred.cpu().numpy().tolist())
+            if proba is not None:
+                y_proba.append(proba.cpu().numpy())
+            if "attention_weights" in out:
+                attn_values.append(out["attention_weights"].cpu().numpy())
+
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+    y_proba_arr = np.concatenate(y_proba, axis=0) if y_proba else None
+    attn_arr = np.concatenate(attn_values, axis=0) if attn_values else None
+    metrics = compute_metrics(y_true_arr, y_pred_arr, y_proba_arr, spec_type, num_classes)
+    return {
+        "mean_loss": float(np.mean(losses)) if losses else math.nan,
+        "metrics": metrics,
+        "y_true": y_true_arr,
+        "y_pred": y_pred_arr,
+        "y_proba": y_proba_arr,
+        "attention_weights": attn_arr,
+    }
 
 
 def _plot_training_log(df: pd.DataFrame, out_path: Path, target_type: TargetType) -> None:
@@ -221,10 +290,6 @@ def _save_debug_panels(
                         pick = 0
                     scatter = scatter[pick]
                 scatter_t = scatter.detach().to(device=device, dtype=torch.float32).unsqueeze(0)
-            elif "image" in sample and "mask" in sample:
-                image_t = sample["image"].detach().to(device=device, dtype=torch.float32).unsqueeze(0)
-                mask_t = sample["mask"].detach().to(device=device, dtype=torch.float32).unsqueeze(0)
-                scatter_t, _ = model.frontend(image_t, mask_t)
             else:
                 continue
 
@@ -243,7 +308,13 @@ def _save_debug_panels(
 
             with torch.no_grad():
                 conv_feat = model.backend.conv(scatter_t)
-                attn_map = conv_feat.abs().mean(dim=1)[0].detach().cpu().numpy().astype(np.float32)
+                attn_map = conv_feat.abs().mean(dim=1, keepdim=True)
+                attn_map = F.interpolate(
+                    attn_map,
+                    size=scatter_t.shape[-3:],
+                    mode="trilinear",
+                    align_corners=False,
+                )[0, 0].detach().cpu().numpy().astype(np.float32)
 
                 model_batch: dict[str, Any] = {}
                 for k, v in sample.items():
@@ -389,23 +460,14 @@ def train(
 
     def _preload_dataset_scatter_to_gpu(
         ds: ScatterRadDataset,
+        keys: set[tuple[str, int]],
         device_obj: torch.device,
         dtype: torch.dtype,
         max_bytes: int,
     ) -> tuple[dict[tuple[str, int], torch.Tensor], dict[tuple[str, int], torch.Tensor], int]:
-        keys: set[tuple[str, int]] = set()
-        if ds.scope is TargetScope.PER_LABEL:
-            for item in ds.samples:
-                basename, label_id = item
-                keys.add((basename, int(label_id)))
-        else:
-            for basename in ds.samples:
-                for label_id in ds.labels:
-                    keys.add((basename, int(label_id)))
-
         scatter_tensors: dict[tuple[str, int], torch.Tensor] = {}
         mask_tensors: dict[tuple[str, int], torch.Tensor] = {}
-        need_mask = bool(task.model_config.get("second_order", False)) and ds.scope is TargetScope.PER_LABEL
+        need_mask = bool(task.model_config.get("second_order", False))
 
         total_bytes = 0
         for basename, label_id in sorted(keys):
@@ -456,8 +518,17 @@ def train(
         fold_info = folds[fold_idx]
         cache_dir = paths.preprocessed_dataset_dir / "scatter_cache"
         has_cache = cache_dir.exists() and any(cache_dir.glob("*.npy"))
-        if has_cache:
-            log.info("Fold %d/%d: scatter cache found — skipping live frontend computation", fold_idx, len(folds) - 1)
+        if not has_cache:
+            raise FileNotFoundError(
+                f"Scatter cache missing at {cache_dir}. Run `scatterrad scatter-cache {paths.dataset_name}` before training."
+            )
+        log.info(
+            "Fold %d/%d: using scatter cache from %s",
+            fold_idx,
+            len(folds) - 1,
+            cache_dir,
+        )
+        cache_aug_variants = max(0, int(task.model_config.get("cache_aug_variants", 0)))
         train_ds = ScatterRadDataset(
             paths=paths,
             basenames=fold_info["train"],
@@ -466,7 +537,7 @@ def train(
             plans=plans,
             labels=labels,
             augment=bool(task.model_config.get("augment", True)),
-            use_scatter_cache=has_cache,
+            cache_aug_variants=cache_aug_variants,
         )
         val_ds = ScatterRadDataset(
             paths=paths,
@@ -476,8 +547,15 @@ def train(
             plans=plans,
             labels=labels,
             augment=False,
-            use_scatter_cache=has_cache,
+            cache_aug_variants=0,
         )
+        if cache_aug_variants > 0:
+            log.info(
+                "Fold %d/%d: training samples will draw from %d cached scatter variants per crop",
+                fold_idx,
+                len(folds) - 1,
+                cache_aug_variants,
+            )
 
         preload_scatter_to_gpu = bool(task.model_config.get("preload_scatter_to_gpu", False))
         if not preload_scatter_to_gpu:
@@ -488,6 +566,12 @@ def train(
                 "yes",
                 "YES",
             }
+        if preload_scatter_to_gpu and cache_aug_variants > 0:
+            log.warning(
+                "GPU scatter preload disabled because cache_aug_variants=%d requires per-sample variant sampling.",
+                cache_aug_variants,
+            )
+            preload_scatter_to_gpu = False
         if preload_scatter_to_gpu and has_cache and device.type == "cuda":
             gpu_dtype_name = str(
                 task.model_config.get(
@@ -506,18 +590,37 @@ def train(
             train_share = min(max(train_share, 0.0), 1.0)
             train_budget = int(total_budget * train_share)
             val_budget = max(0, total_budget - train_budget)
+            train_cache_keys = _dataset_cache_keys(train_ds)
+            val_cache_keys = _dataset_cache_keys(val_ds)
             train_scatter, train_masks, used_train = _preload_dataset_scatter_to_gpu(
-                train_ds, device, gpu_dtype, max_bytes=train_budget
+                train_ds, train_cache_keys, device, gpu_dtype, max_bytes=train_budget
             )
             remaining_for_val = max(0, val_budget - max(0, used_train - train_budget))
             val_scatter, val_masks, _used_val = _preload_dataset_scatter_to_gpu(
-                val_ds, device, gpu_dtype, max_bytes=remaining_for_val
+                val_ds, val_cache_keys, device, gpu_dtype, max_bytes=remaining_for_val
             )
-            train_ds.scatter_cache_tensors = train_scatter
-            train_ds.scatter_mask_tensors = train_masks
-            val_ds.scatter_cache_tensors = val_scatter
-            val_ds.scatter_mask_tensors = val_masks
-            log.info("GPU scatter preload enabled; forcing dataloader workers=0 for CUDA safety")
+            require_masks = bool(task.model_config.get("second_order", False))
+            train_complete = len(train_scatter) == len(train_cache_keys)
+            val_complete = len(val_scatter) == len(val_cache_keys)
+            if require_masks:
+                train_complete = train_complete and len(train_masks) == len(train_cache_keys)
+                val_complete = val_complete and len(val_masks) == len(val_cache_keys)
+            if train_complete and val_complete:
+                train_ds.scatter_cache_tensors = train_scatter
+                train_ds.scatter_mask_tensors = train_masks
+                val_ds.scatter_cache_tensors = val_scatter
+                val_ds.scatter_mask_tensors = val_masks
+                log.info("GPU scatter preload enabled; forcing dataloader workers=0 for CUDA safety")
+            else:
+                log.warning(
+                    "GPU scatter preload disabled because the cache did not fully fit in memory "
+                    "(train %d/%d, val %d/%d tensors preloaded).",
+                    len(train_scatter),
+                    len(train_cache_keys),
+                    len(val_scatter),
+                    len(val_cache_keys),
+                )
+                preload_scatter_to_gpu = False
 
         if len(train_ds) == 0 or len(val_ds) == 0:
             log.warning("Fold %d/%d: skipping due to empty dataset", fold_idx, len(folds) - 1)
@@ -528,20 +631,17 @@ def train(
             fold_idx, len(folds) - 1, len(train_ds), len(val_ds),
         )
 
-        # If scatter cache exists, read out_channels/out_shape from a cache entry
-        # to avoid running the expensive kymatio dummy forward during model init.
         scatter_out_channels: int | None = None
         scatter_out_shape: tuple | None = None
-        if has_cache:
-            sample_npy = next(cache_dir.glob("*.npy"), None)
-            if sample_npy is not None:
-                arr = np.load(sample_npy)  # shape: (C, D, H, W)
-                scatter_out_channels = int(arr.shape[0])
-                scatter_out_shape = tuple(int(x) for x in arr.shape[1:])
-                log.info(
-                    "Fold %d/%d: scatter cache — out_channels=%d  out_shape=%s",
-                    fold_idx, len(folds) - 1, scatter_out_channels, scatter_out_shape,
-                )
+        sample_npy = next(cache_dir.glob("*.npy"), None)
+        if sample_npy is not None:
+            arr = np.load(sample_npy)  # shape: (C, D, H, W)
+            scatter_out_channels = int(arr.shape[0])
+            scatter_out_shape = tuple(int(x) for x in arr.shape[1:])
+            log.info(
+                "Fold %d/%d: scatter cache — out_channels=%d  out_shape=%s",
+                fold_idx, len(folds) - 1, scatter_out_channels, scatter_out_shape,
+            )
 
         wavelet = str(task.model_config.get("wavelet", "coif1"))
         level = int(task.model_config.get("level", task.model_config.get("J", 1)))
@@ -579,10 +679,6 @@ def train(
             model.frontend.out_channels, model.frontend.out_shape, n_params,
         )
 
-        if bool(task.model_config.get("cache_scatter_output", False)):
-            precompute_and_cache(paths, model.frontend, device=str(device))
-
-        sampler = ClassBalancedSampler(train_ds, seed=task.cv.seed)
         train_workers = _loader_num_workers(task, len(train_ds))
         val_workers = _loader_num_workers(task, len(val_ds))
         if preload_scatter_to_gpu and has_cache and device.type == "cuda":
@@ -591,10 +687,17 @@ def train(
         use_cuda = device.type == "cuda" and not (
             preload_scatter_to_gpu and has_cache and device.type == "cuda"
         )
+        train_sampler = None
+        train_shuffle = False
+        if spec.type is TargetType.CLASSIFICATION:
+            train_sampler = ClassBalancedSampler(train_ds, seed=task.cv.seed)
+        else:
+            train_shuffle = True
         train_loader = DataLoader(
             train_ds,
             batch_size=int(task.model_config.get("batch_size", 16)),
-            sampler=sampler,
+            sampler=train_sampler,
+            shuffle=train_shuffle,
             collate_fn=scatter_collate_fn,
             num_workers=train_workers,
             pin_memory=use_cuda,
@@ -612,28 +715,6 @@ def train(
 
         max_epochs = int(task.model_config.get("epochs", 100))
 
-        # Compute pos_weight for binary classification from training labels
-        pos_weight: torch.Tensor | None = None
-        if spec.type is TargetType.CLASSIFICATION and (spec.num_classes or 2) == 2:
-            train_targets = np.asarray([
-                int(train_ds.case_targets[
-                    s[0] if isinstance(s, tuple) else s
-                ].get_per_label(task.target, s[1]) if isinstance(s, tuple)
-                else train_ds.case_targets[s].get_per_case(task.target))
-                for s in train_ds.samples
-            ])
-            n_pos = int(train_targets.sum())
-            n_neg = len(train_targets) - n_pos
-            if n_pos > 0 and n_neg > 0:
-                # Use sqrt of ratio to soften the imbalance correction.
-                # Raw n_neg/n_pos drives the model to predict all-positive
-                # even when a balanced sampler is already used.
-                pos_weight = torch.tensor([np.sqrt(n_neg / n_pos)], dtype=torch.float32).to(device)
-                log.info("Fold %d/%d: pos_weight=%.2f  (n_pos=%d n_neg=%d)",
-                    fold_idx, len(folds) - 1, float(pos_weight), n_pos, n_neg)
-
-        # AdamW + cosine annealing — more stable than SGD for the small scatter
-        # feature space (model sees O(100) values per sample, not full image patches).
         lr = float(task.model_config.get("lr", 3e-5))
         optimizer = AdamW(
             model.parameters(),
@@ -642,7 +723,7 @@ def train(
         )
         eta_min = float(task.model_config.get("lr_min", 1e-6))
         scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=eta_min)
-        loss_fn = _loss_fn(spec.type, spec.num_classes, pos_weight=pos_weight)
+        loss_fn = _loss_fn(spec.type, spec.num_classes)
         amp_enabled = bool(
             task.model_config.get(
                 "amp",
@@ -652,11 +733,12 @@ def train(
         scaler = amp.GradScaler("cuda", enabled=amp_enabled)
         start_epoch = 0
         best_metric = -float("inf")
-        best_state = None
+        best_state: dict[str, torch.Tensor] | None = None
         best_epoch = 0
         epochs_without_improvement = 0
         early_stopping_patience = int(task.model_config.get("early_stopping_patience", 12))
         early_stopping_min_epochs = int(task.model_config.get("early_stopping_min_epochs", 20))
+        training_log: list[dict[str, Any]] = []
 
         resume_path: Path | None = None
         if continue_existing and fold_checkpoint.exists():
@@ -666,14 +748,20 @@ def train(
         if resume_path is not None:
             payload = torch.load(resume_path, map_location=device)
             state_dict = _load_state_dict_from_checkpoint(payload)
-            model.load_state_dict(state_dict, strict=False)
+            model.load_state_dict(state_dict)
             log.info("Loaded model weights from %s", resume_path)
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             if resume_path == fold_checkpoint and continue_existing and isinstance(payload, dict):
                 if "optimizer" in payload and isinstance(payload["optimizer"], dict):
                     optimizer.load_state_dict(payload["optimizer"])
-                if "epoch" in payload:
+                if "scheduler" in payload and isinstance(payload["scheduler"], dict):
+                    scheduler.load_state_dict(payload["scheduler"])
+                if "scaler" in payload and isinstance(payload["scaler"], dict):
+                    scaler.load_state_dict(payload["scaler"])
+                last_completed_epoch = payload.get("last_epoch", payload.get("epoch"))
+                if last_completed_epoch is not None:
                     try:
-                        start_epoch = int(payload["epoch"]) + 1
+                        start_epoch = int(last_completed_epoch) + 1
                     except (TypeError, ValueError):
                         start_epoch = 0
                 if "best_metric" in payload:
@@ -681,6 +769,19 @@ def train(
                         best_metric = float(payload["best_metric"])
                     except (TypeError, ValueError):
                         best_metric = -float("inf")
+                if "best_epoch" in payload:
+                    try:
+                        best_epoch = int(payload["best_epoch"])
+                    except (TypeError, ValueError):
+                        best_epoch = 0
+                elif "epoch" in payload:
+                    try:
+                        best_epoch = int(payload["epoch"])
+                    except (TypeError, ValueError):
+                        best_epoch = 0
+                training_log_path = result_dir / "training_log.csv"
+                if training_log_path.exists():
+                    training_log = pd.read_csv(training_log_path).to_dict("records")
 
         log.info(
             "Fold %d/%d: training for %d epochs  lr=%.0e  eta_min=%.0e  batch=%d  "
@@ -701,10 +802,12 @@ def train(
             int(task.model_config.get("debug_num_cases_val", debug_cases_default)),
         )
 
-        training_log: list[dict] = []
         t0 = perf_counter()
+        last_epoch = start_epoch - 1
         for epoch in range(start_epoch, max_epochs):
-            sampler.set_epoch(epoch)
+            last_epoch = epoch
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             model.train()
             epoch_losses = []
             for batch in train_loader:
@@ -733,48 +836,16 @@ def train(
                 scaler.update()
                 epoch_losses.append(float(loss.detach()))
 
-            model.eval()
-            y_true = []
-            y_pred = []
-            y_proba = []
-            attn_values = []
-            val_losses = []
-            with torch.no_grad():
-                for batch in val_loader:
-                    batch = {
-                        k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
-                    }
-                    if (
-                        "scatter" in batch
-                        and torch.is_tensor(batch["scatter"])
-                        and not amp_enabled
-                    ):
-                        batch["scatter"] = batch["scatter"].float()
-                    with amp.autocast("cuda", enabled=amp_enabled):
-                        out = model(batch)
-                        logits = out["logits"]
-                        target = batch["target"]
-                        if spec.type is TargetType.REGRESSION:
-                            val_loss = loss_fn(logits.squeeze(-1), target.float())
-                        elif (spec.num_classes or 2) == 2:
-                            val_loss = loss_fn(logits.squeeze(-1), target.float())
-                        else:
-                            val_loss = loss_fn(logits, target.long())
-                    val_losses.append(float(val_loss))
-                    pred, proba = _predict_from_logits(logits, spec.type, spec.num_classes)
-                    y_true.extend(target.cpu().numpy().tolist())
-                    y_pred.extend(pred.cpu().numpy().tolist())
-                    if proba is not None:
-                        y_proba.append(proba.cpu().numpy())
-                    if "attention_weights" in out:
-                        attn_values.append(out["attention_weights"].cpu().numpy())
-
-            y_true_arr = np.asarray(y_true)
-            y_pred_arr = np.asarray(y_pred)
-            y_proba_arr = np.concatenate(y_proba, axis=0) if y_proba else None
-            metrics = compute_metrics(
-                y_true_arr, y_pred_arr, y_proba_arr, spec.type, spec.num_classes
+            eval_result = _evaluate_model(
+                model=model,
+                loader=val_loader,
+                spec_type=spec.type,
+                num_classes=spec.num_classes,
+                loss_fn=loss_fn,
+                device=device,
+                amp_enabled=amp_enabled,
             )
+            metrics = eval_result["metrics"]
 
             if spec.type is TargetType.REGRESSION:
                 score = -float(metrics["mae"])
@@ -794,7 +865,7 @@ def train(
                 fold_idx, len(folds) - 1,
                 epoch + 1, max_epochs,
                 float(np.mean(epoch_losses)),
-                float(np.mean(val_losses)),
+                float(eval_result["mean_loss"]),
                 score_str,
                 current_lr,
                 " *" if is_best else "",
@@ -803,7 +874,7 @@ def train(
             log_row = {
                 "epoch": epoch + 1,
                 "train_loss": float(np.mean(epoch_losses)),
-                "val_loss": float(np.mean(val_losses)),
+                "val_loss": float(eval_result["mean_loss"]),
                 "lr": current_lr,
                 "is_best": is_best,
             }
@@ -873,20 +944,34 @@ def train(
         runtime = perf_counter() - t0
         if best_state is not None:
             model.load_state_dict(best_state)
+        final_eval = _evaluate_model(
+            model=model,
+            loader=val_loader,
+            spec_type=spec.type,
+            num_classes=spec.num_classes,
+            loss_fn=loss_fn,
+            device=device,
+            amp_enabled=amp_enabled,
+        )
+        final_metrics = final_eval["metrics"]
 
         result_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "state_dict": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "epoch": best_epoch,
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": last_epoch,
+                "last_epoch": last_epoch,
+                "best_epoch": best_epoch,
                 "best_metric": float(best_metric),
                 "task": task.name,
             },
             result_dir / "checkpoint.pt",
         )
 
-        pred_df = pd.DataFrame({"y_true": y_true_arr, "y_pred": y_pred_arr})
+        pred_df = pd.DataFrame({"y_true": final_eval["y_true"], "y_pred": final_eval["y_pred"]})
         pred_df.to_csv(result_dir / "predictions.csv", index=False)
 
         payload = {
@@ -896,11 +981,12 @@ def train(
             "n_train": len(train_ds),
             "n_val": len(val_ds),
             "target_type": spec.type.value,
-            "metrics": metrics,
+            "metrics": final_metrics,
+            "best_epoch": best_epoch + 1,
             "runtime_seconds": float(runtime),
         }
-        if attn_values:
-            mean_attn = np.concatenate(attn_values, axis=0).mean(axis=0)
+        if final_eval["attention_weights"] is not None:
+            mean_attn = final_eval["attention_weights"].mean(axis=0)
             payload["attention_weights_mean"] = {
                 str(label): float(w) for label, w in zip(labels, mean_attn)
             }
@@ -908,9 +994,11 @@ def train(
             json.dumps(payload, indent=2, sort_keys=True) + "\n"
         )
         (result_dir / "log.txt").write_text(
-            f"best_epoch={best_epoch}\nbest_metric={best_metric:.6f}\n"
+            f"best_epoch={best_epoch + 1}\n"
+            f"last_epoch={last_epoch + 1}\n"
+            f"best_metric={best_metric:.6f}\n"
         )
-        metrics_str = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if isinstance(v, float))
+        metrics_str = "  ".join(f"{k}={v:.4f}" for k, v in final_metrics.items() if isinstance(v, float))
         log.info(
             "Fold %d/%d done in %.1fs  best_epoch=%d  →  %s",
             fold_idx, len(folds) - 1, runtime, best_epoch + 1, metrics_str,

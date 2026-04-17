@@ -7,14 +7,18 @@ import torch
 from torch.utils.data import Dataset
 
 from scatterrad.config import PlansConfig, TaskConfig, TargetScope, TargetsSchema, load_case_targets
-from scatterrad.data.augment import augment_crop
-from scatterrad.models.scatter.scatter_cache import load_cached_scatter
+from scatterrad.models.scatter.scatter_cache import (
+    load_cached_scatter,
+    parse_scatter_cache_filename,
+    scatter_cache_path,
+    scatter_cache_paths,
+)
 from scatterrad.paths import ScatterRadPaths
 from scatterrad.preprocessing.crop import read_crop
 
 
 class ScatterRadDataset(Dataset):
-    """Dataset for scatter training in per-label or per-case scope."""
+    """Cache-backed dataset for scatter training in per-label or per-case scope."""
 
     def __init__(
         self,
@@ -25,9 +29,9 @@ class ScatterRadDataset(Dataset):
         plans: PlansConfig,
         labels: tuple[int, ...],
         augment: bool = False,
-        use_scatter_cache: bool = False,
         scatter_cache_tensors: dict[tuple[str, int], torch.Tensor] | None = None,
         scatter_mask_tensors: dict[tuple[str, int], torch.Tensor] | None = None,
+        cache_aug_variants: int = 0,
     ):
         self.paths = paths
         self.schema = schema
@@ -35,7 +39,7 @@ class ScatterRadDataset(Dataset):
         self.plans = plans
         self.labels = labels
         self.augment = augment
-        self.use_scatter_cache = use_scatter_cache
+        self.cache_aug_variants = max(0, int(cache_aug_variants))
         self._need_cache_mask = bool(task.model_config.get("second_order", False))
         self.scatter_cache_tensors = scatter_cache_tensors or {}
         self.scatter_mask_tensors = scatter_mask_tensors or {}
@@ -51,6 +55,8 @@ class ScatterRadDataset(Dataset):
                     target_file, schema=schema, basename=basename
                 )
 
+        self._validate_cache()
+
         self.samples: list[tuple[str, int] | str] = []
         if self.scope is TargetScope.PER_LABEL:
             for basename in basenames:
@@ -61,8 +67,7 @@ class ScatterRadDataset(Dataset):
                     target = ct.get_per_label(task.target, label_id)
                     if math.isnan(target):
                         continue
-                    crop_path = paths.crop_path(basename, label_id)
-                    if crop_path.exists():
+                    if scatter_cache_path(paths, basename, label_id).exists():
                         self.samples.append((basename, label_id))
         else:
             for basename in basenames:
@@ -72,151 +77,161 @@ class ScatterRadDataset(Dataset):
                 target = ct.get_per_case(task.target)
                 if math.isnan(target):
                     continue
-                has_any = any(paths.crop_path(basename, label_id).exists() for label_id in labels)
+                has_any = any(
+                    scatter_cache_path(paths, basename, label_id).exists() for label_id in labels
+                )
                 if has_any:
                     self.samples.append(basename)
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _validate_cache(self) -> None:
+        missing: list[str] = []
+        stale: list[str] = []
+        for basename in self.case_targets:
+            for label_id in self.labels:
+                crop_path = self.paths.crop_path(basename, label_id)
+                crop_exists = crop_path.exists()
+                cache_paths = scatter_cache_paths(
+                    self.paths,
+                    basename,
+                    label_id,
+                    num_augmented_variants=self.cache_aug_variants,
+                )
+                if crop_exists:
+                    for cache_path in cache_paths:
+                        if not cache_path.exists():
+                            missing.append(cache_path.stem)
+                else:
+                    for cache_path in cache_paths:
+                        if cache_path.exists():
+                            stale.append(cache_path.stem)
+        for cache_path in self.paths.preprocessed_dataset_dir.joinpath("scatter_cache").glob("*.npy"):
+            parsed = parse_scatter_cache_filename(cache_path)
+            if parsed is None:
+                continue
+            basename, label_id, _variant_idx = parsed
+            if not self.paths.crop_path(basename, label_id).exists():
+                stale.append(cache_path.stem)
+        if missing:
+            preview = ", ".join(missing[:8])
+            raise RuntimeError(
+                "Scatter cache is incomplete for the current crops. "
+                f"Missing cache entries for: {preview}"
+            )
+        if stale:
+            preview = ", ".join(stale[:8])
+            raise RuntimeError(
+                "Scatter cache contains entries without matching crops. "
+                f"Stale cache entries include: {preview}"
+            )
+
     def _target_tensor(self, value: float) -> torch.Tensor:
         if self.target_type.value == "classification":
             return torch.tensor(int(value), dtype=torch.long)
         return torch.tensor(float(value), dtype=torch.float32)
 
-    @staticmethod
-    def _pad_numpy_to_shape(arr: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
-        out = np.zeros(shape, dtype=arr.dtype)
-        d, h, w = arr.shape
-        out[:d, :h, :w] = arr
-        return out
+    def _load_mask_tensor(self, basename: str, label_id: int, device: torch.device | None) -> torch.Tensor:
+        _, mask, _ = read_crop(self.paths.crop_path(basename, label_id))
+        mask_tensor = torch.from_numpy(mask[None, ...].astype(np.float32))
+        if device is not None:
+            mask_tensor = mask_tensor.to(device=device)
+        return mask_tensor
+
+    def _sample_variant_idx(self) -> int:
+        if self.cache_aug_variants <= 0:
+            return 0
+        return int(self._rng.integers(0, self.cache_aug_variants + 1))
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
         if self.scope is TargetScope.PER_LABEL:
             basename, label_id = sample
-            if self.use_scatter_cache:
-                key = (basename, int(label_id))
-                scatter_tensor = self.scatter_cache_tensors.get(key)
-                if scatter_tensor is None:
-                    scatter = load_cached_scatter(self.paths, basename, label_id)
-                    if scatter is None:
-                        raise RuntimeError(f"Scatter cache miss for {basename} label {label_id}")
-                    scatter_tensor = torch.from_numpy(scatter)
-                mask_tensor = None
-                if self._need_cache_mask:
-                    mask_tensor = self.scatter_mask_tensors.get(key)
-                    if mask_tensor is None:
-                        _, mask, _ = read_crop(self.paths.crop_path(basename, label_id))
-                        mask_tensor = torch.from_numpy(mask[None, ...].astype(np.float32))
-                if self.augment:
-                    scatter_tensor, mask_tensor = self._augment_cached_sample(
-                        scatter_tensor, mask_tensor
+            variant_idx = self._sample_variant_idx()
+            key = (basename, int(label_id))
+            scatter_tensor = self.scatter_cache_tensors.get(key)
+            if scatter_tensor is None:
+                scatter = load_cached_scatter(self.paths, basename, label_id, variant_idx=variant_idx)
+                if scatter is None:
+                    raise RuntimeError(
+                        f"Scatter cache miss for {basename} label {label_id} variant {variant_idx}"
                     )
-                target_value = self.case_targets[basename].get_per_label(self.task.target, label_id)
-                item = {
-                    "scatter": scatter_tensor,
-                    "target": self._target_tensor(target_value),
-                    "present": torch.tensor(True),
-                    "meta": {"basename": basename, "label_id": int(label_id)},
-                }
-                if self._need_cache_mask:
-                    item["mask"] = mask_tensor
-                return item
-
-            image, mask, _ = read_crop(self.paths.crop_path(basename, label_id))
+                scatter_tensor = torch.from_numpy(scatter)
+            mask_tensor = None
+            if self._need_cache_mask:
+                mask_tensor = self.scatter_mask_tensors.get(key)
+                if mask_tensor is None:
+                    mask_tensor = self._load_mask_tensor(basename, label_id, scatter_tensor.device)
             if self.augment:
-                image, mask = augment_crop(image, mask, self._rng)
+                scatter_tensor, mask_tensor = self._augment_cached_sample(scatter_tensor, mask_tensor)
             target_value = self.case_targets[basename].get_per_label(self.task.target, label_id)
-            return {
-                "image": torch.from_numpy(image[None, ...].astype(np.float32)),
-                "mask": torch.from_numpy(mask[None, ...].astype(np.float32)),
+            item = {
+                "scatter": scatter_tensor,
                 "target": self._target_tensor(target_value),
                 "present": torch.tensor(True),
                 "meta": {"basename": basename, "label_id": int(label_id)},
             }
+            if self._need_cache_mask:
+                item["mask"] = mask_tensor
+            return item
 
         basename = sample
-        imgs = []
-        msks = []
         scatters = []
+        masks = []
         present = []
         for label_id in self.labels:
-            if self.use_scatter_cache:
-                key = (basename, int(label_id))
-                scatter_tensor = self.scatter_cache_tensors.get(key)
-                if scatter_tensor is not None:
-                    if self.augment:
-                        scatter_tensor, _ = self._augment_cached_sample(scatter_tensor, None)
-                    scatters.append(scatter_tensor)
-                    present.append(True)
-                else:
-                    scatter = load_cached_scatter(self.paths, basename, label_id)
-                    if scatter is not None:
-                        scatter_tensor = torch.from_numpy(scatter)
-                        if self.augment:
-                            scatter_tensor, _ = self._augment_cached_sample(scatter_tensor, None)
-                        scatters.append(scatter_tensor)
-                        present.append(True)
-                    else:
-                        scatters.append(None)
-                        present.append(False)
-            else:
-                crop_path = self.paths.crop_path(basename, label_id)
-                if crop_path.exists():
-                    image, mask, _ = read_crop(crop_path)
-                    if self.augment:
-                        image, mask = augment_crop(image, mask, self._rng)
-                    present.append(True)
-                else:
-                    image = None
-                    mask = None
-                    present.append(False)
-                imgs.append(image)
-                msks.append(mask)
+            variant_idx = self._sample_variant_idx()
+            key = (basename, int(label_id))
+            if not scatter_cache_path(self.paths, basename, label_id).exists():
+                scatters.append(None)
+                if self._need_cache_mask:
+                    masks.append(None)
+                present.append(False)
+                continue
+
+            scatter_tensor = self.scatter_cache_tensors.get(key)
+            if scatter_tensor is None:
+                scatter = load_cached_scatter(self.paths, basename, label_id, variant_idx=variant_idx)
+                if scatter is None:
+                    raise RuntimeError(
+                        f"Scatter cache miss for {basename} label {label_id} variant {variant_idx}"
+                    )
+                scatter_tensor = torch.from_numpy(scatter)
+
+            mask_tensor = None
+            if self._need_cache_mask:
+                mask_tensor = self.scatter_mask_tensors.get(key)
+                if mask_tensor is None:
+                    mask_tensor = self._load_mask_tensor(basename, label_id, scatter_tensor.device)
+
+            if self.augment:
+                scatter_tensor, mask_tensor = self._augment_cached_sample(scatter_tensor, mask_tensor)
+
+            scatters.append(scatter_tensor)
+            if self._need_cache_mask:
+                masks.append(mask_tensor)
+            present.append(True)
 
         target_value = self.case_targets[basename].get_per_case(self.task.target)
 
-        if self.use_scatter_cache:
-            # Fill missing labels with zeros matching the shape of the first present cache entry
-            ref = next((s for s in scatters if s is not None), None)
-            if ref is None:
-                raise RuntimeError(f"No scatter cache entries found for {basename}")
-            filled = [s if s is not None else torch.zeros_like(ref) for s in scatters]
-            scatter = torch.stack(filled, dim=0).float()
-            return {
-                "scatter": scatter,
-                "target": self._target_tensor(target_value),
-                "present": torch.tensor(present, dtype=torch.bool),
-                "meta": {"basename": basename, "label_ids": list(self.labels)},
-            }
-
-        present_imgs = [x for x in imgs if x is not None]
-        if not present_imgs:
-            raise RuntimeError(f"No image crops found for {basename}")
-        max_d = max(int(x.shape[0]) for x in present_imgs)
-        max_h = max(int(x.shape[1]) for x in present_imgs)
-        max_w = max(int(x.shape[2]) for x in present_imgs)
-        target_shape = (max_d, max_h, max_w)
-        imgs_pad = [
-            self._pad_numpy_to_shape(x, target_shape)
-            if x is not None
-            else np.zeros(target_shape, dtype=np.float32)
-            for x in imgs
-        ]
-        msks_pad = [
-            self._pad_numpy_to_shape(x, target_shape)
-            if x is not None
-            else np.zeros(target_shape, dtype=np.uint8)
-            for x in msks
-        ]
-        return {
-            "images": torch.from_numpy(np.asarray(imgs_pad, dtype=np.float32)[:, None, ...]),
-            "masks": torch.from_numpy(np.asarray(msks_pad, dtype=np.float32)[:, None, ...]),
+        ref = next((s for s in scatters if s is not None), None)
+        if ref is None:
+            raise RuntimeError(f"No scatter cache entries found for {basename}")
+        filled = [s if s is not None else torch.zeros_like(ref) for s in scatters]
+        item = {
+            "scatter": torch.stack(filled, dim=0).float(),
             "target": self._target_tensor(target_value),
             "present": torch.tensor(present, dtype=torch.bool),
             "meta": {"basename": basename, "label_ids": list(self.labels)},
         }
+        if self._need_cache_mask:
+            ref_mask = next((m for m in masks if m is not None), None)
+            if ref_mask is None:
+                raise RuntimeError(f"No mask tensors found for {basename}")
+            filled_masks = [m if m is not None else torch.zeros_like(ref_mask) for m in masks]
+            item["masks"] = torch.stack(filled_masks, dim=0).float()
+        return item
 
     def _augment_cached_sample(
         self,

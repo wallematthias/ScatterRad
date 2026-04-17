@@ -10,7 +10,7 @@ from scatterrad.models.scatter.pooling import MaskedAttentionPool
 
 
 class ScatterRadModel(nn.Module):
-    """End-to-end filter-bank model for per-label and per-case tasks."""
+    """Cache-backed scatter model for per-label and per-case tasks."""
 
     def __init__(
         self,
@@ -70,10 +70,6 @@ class ScatterRadModel(nn.Module):
             nn.Linear(hidden_channels, out_dim),
         )
 
-    def _encode(self, image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        bands, m = self.frontend(image, mask)
-        return self.backend(bands, m)
-
     def _encode_from_scatter(
         self, scatter: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -83,33 +79,25 @@ class ScatterRadModel(nn.Module):
         return self.backend(scatter, mask)
 
     def forward(self, batch: dict) -> dict:
+        if "scatter" not in batch:
+            raise ValueError("ScatterRadModel expects precomputed scatter tensors in batch['scatter']")
+
         if self.target_scope is TargetScope.PER_LABEL:
-            if "scatter" in batch:
-                feats = self._encode_from_scatter(batch["scatter"], batch.get("mask"))
-            else:
-                feats = self._encode(batch["image"], batch["mask"])
+            feats = self._encode_from_scatter(batch["scatter"], batch.get("mask"))
             logits = self.head(feats)
             return {"logits": logits}
 
         present = batch["present"]
-        if "scatter" in batch:
-            scatter = batch["scatter"]  # (B, N, C, D, H, W)
-            b, n = scatter.shape[:2]
-            masks = batch.get("masks")
-            if masks is not None:
-                feats = self._encode_from_scatter(
-                    scatter.view(b * n, *scatter.shape[2:]),
-                    masks.view(b * n, *masks.shape[2:]),
-                )
-            else:
-                feats = self._encode_from_scatter(scatter.view(b * n, *scatter.shape[2:]))
-        else:
-            images = batch["images"]
-            masks = batch["masks"]
-            b, n = images.shape[:2]
-            feats = self._encode(
-                images.view(b * n, *images.shape[2:]), masks.view(b * n, *masks.shape[2:])
+        scatter = batch["scatter"]  # (B, N, C, D, H, W)
+        b, n = scatter.shape[:2]
+        masks = batch.get("masks")
+        if masks is not None:
+            feats = self._encode_from_scatter(
+                scatter.view(b * n, *scatter.shape[2:]),
+                masks.view(b * n, *masks.shape[2:]),
             )
+        else:
+            feats = self._encode_from_scatter(scatter.view(b * n, *scatter.shape[2:]))
         feats = feats.view(b, n, -1)
         pooled, attn = self.pool(feats, present)
         logits = self.head(pooled)

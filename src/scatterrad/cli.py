@@ -173,7 +173,6 @@ def cmd_generate_holdout(args: argparse.Namespace) -> int:
 
 
 def cmd_scatter_cache(args: argparse.Namespace) -> int:
-    from scatterrad.config import load_dataset_config
     from scatterrad.models.scatter.frontend import ScatterFrontend
     from scatterrad.models.scatter.scatter_cache import precompute_and_cache
     from scatterrad.config import PlansConfig
@@ -203,11 +202,22 @@ def cmd_scatter_cache(args: argparse.Namespace) -> int:
     )
     logging.getLogger(__name__).info(
         "Filter-bank frontend: wavelet=%s level=%d  log_sigmas=%s  gradient=%s  "
-        "out_channels=%d  spacing_mm=%s  device=%s",
+        "out_channels=%d  spacing_mm=%s  device=%s  cache_aug_variants=%d",
         args.wavelet, args.level, log_sigmas_mm, not args.no_gradient,
-        frontend.out_channels, spacing_mm, device,
+        frontend.out_channels, spacing_mm, device, int(args.augment_variants),
     )
-    precompute_and_cache(paths=paths, frontend=frontend, device=device)
+    precompute_and_cache(
+        paths=paths,
+        frontend=frontend,
+        device=device,
+        num_augmented_variants=int(args.augment_variants),
+        cache_aug_seed=int(args.augment_seed),
+        intensity_scale_delta=float(args.aug_intensity_scale),
+        intensity_shift_delta=float(args.aug_intensity_shift),
+        noise_std=float(args.aug_noise_std),
+        elastic_alpha=float(args.aug_elastic_alpha),
+        elastic_sigma=float(args.aug_elastic_sigma),
+    )
     logging.getLogger(__name__).info("Scatter cache written to %s", paths.preprocessed_dataset_dir / "scatter_cache")
     return 0
 
@@ -259,6 +269,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         logging.getLogger(__name__).info("Auto-generated task name: %s", task.name)
 
     if task.model is ModelKind.SCATTER:
+        if args.cache_aug_variants is not None:
+            task.model_config["cache_aug_variants"] = int(args.cache_aug_variants)
         if bool(args.debug):
             task.model_config["debug"] = True
         if args.debug_every is not None:
@@ -443,6 +455,48 @@ def build_parser() -> argparse.ArgumentParser:
     p_scatter_cache.add_argument("--no-gradient", action="store_true", help="Disable gradient magnitude channel")
     p_scatter_cache.add_argument("--device", default=None, help="cuda or cpu (default: auto)")
     p_scatter_cache.add_argument("--force", action="store_true", help="Delete existing cache and recompute")
+    p_scatter_cache.add_argument(
+        "--augment-variants",
+        type=int,
+        default=0,
+        help="Number of extra augmented cache variants to generate per crop (default: 0).",
+    )
+    p_scatter_cache.add_argument(
+        "--augment-seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic cache augmentation variants (default: 42).",
+    )
+    p_scatter_cache.add_argument(
+        "--aug-intensity-scale",
+        type=float,
+        default=0.1,
+        help="Max multiplicative intensity jitter delta around 1.0 for augmented cache variants.",
+    )
+    p_scatter_cache.add_argument(
+        "--aug-intensity-shift",
+        type=float,
+        default=0.1,
+        help="Max additive intensity jitter magnitude for augmented cache variants.",
+    )
+    p_scatter_cache.add_argument(
+        "--aug-noise-std",
+        type=float,
+        default=0.05,
+        help="Upper bound of Gaussian noise sigma for augmented cache variants.",
+    )
+    p_scatter_cache.add_argument(
+        "--aug-elastic-alpha",
+        type=float,
+        default=1.0,
+        help="Elastic displacement magnitude in voxels for augmented cache variants.",
+    )
+    p_scatter_cache.add_argument(
+        "--aug-elastic-sigma",
+        type=float,
+        default=6.0,
+        help="Elastic smoothing sigma in voxels for augmented cache variants.",
+    )
     p_scatter_cache.set_defaults(func=cmd_scatter_cache)
 
     p_perturb = sub.add_parser("radiomics-perturb")
@@ -471,6 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("-c", "--continue", dest="cont", action="store_true")
     p_train.add_argument("--resume-from", type=Path, default=None)
     p_train.add_argument("--gpu", type=int, default=None)
+    p_train.add_argument(
+        "--cache-aug-variants",
+        type=int,
+        default=None,
+        help="Scatter model: number of extra cached augmentation variants to sample during training.",
+    )
     p_train.add_argument(
         "--debug",
         action="store_true",
