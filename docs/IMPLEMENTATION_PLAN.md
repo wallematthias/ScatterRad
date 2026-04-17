@@ -28,7 +28,7 @@ wrong. Do not proceed to Phase 1 until all tests pass.
 
 ---
 
-## Phase 1 — Preprocessing planner
+## Phase 1 — Preprocessing planner (DONE)
 
 **Spec:** `docs/modules/02_preprocessing.md` (section: planner)
 
@@ -52,7 +52,7 @@ Scope boundary:
 
 ---
 
-## Phase 2 — Preprocessing runner (crops + caching)
+## Phase 2 — Preprocessing runner (crops + caching) (DONE)
 
 **Spec:** `docs/modules/02_preprocessing.md` (sections: resample, normalize, crop)
 
@@ -73,7 +73,7 @@ Deliverables:
 
 ---
 
-## Phase 3 — Radiomics track (end-to-end baseline)
+## Phase 3 — Radiomics track (end-to-end baseline) (DONE)
 
 **Spec:** `docs/modules/03_radiomics_track.md`
 
@@ -96,7 +96,7 @@ This is the **baseline** the scatter track must beat. Get it solid.
 
 ---
 
-## Phase 4 — Scatter track: frontend + backend
+## Phase 4 — Scatter track: frontend + backend (DONE)
 
 **Spec:** `docs/modules/04_scatter_track.md`
 
@@ -116,7 +116,7 @@ Deliverables:
 
 ---
 
-## Phase 5 — Scatter track: data + training
+## Phase 5 — Scatter track: data + training (DONE)
 
 **Spec:** `docs/modules/04_scatter_track.md` (section: training) +
 `docs/modules/05_data_loading.md`
@@ -138,7 +138,7 @@ Deliverables:
 
 ---
 
-## Phase 6 — Evaluation + reporting
+## Phase 6 — Evaluation + reporting (DONE)
 
 **Spec:** `docs/modules/06_evaluation.md`
 
@@ -155,7 +155,7 @@ Deliverables:
 
 ---
 
-## Phase 7 — Predict (inference on new cases)
+## Phase 7 — Predict (inference on new cases) (DONE)
 
 **Spec:** `docs/modules/07_cli_wiring.md`
 

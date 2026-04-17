@@ -4,6 +4,13 @@ This file is **the first thing you should read** in any session. It tells you ho
 to navigate the repo, what to read, what NOT to read, and how to stay
 token-efficient.
 
+> Recommended environment: activate the `scatterrad` conda env before building
+> or running the repo, so PyTorch, pyradiomics, and kymatio are available.
+>
+> ```bash
+> conda activate scatterrad
+> ```
+
 ---
 
 ## Golden rules

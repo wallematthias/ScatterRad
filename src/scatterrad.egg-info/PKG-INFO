@@ -1,0 +1,39 @@
+Metadata-Version: 2.4
+Name: scatterrad
+Version: 0.1.0
+Summary: ScatterRad texture classification framework
+Author: ScatterRad
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy<2,>=1.24
+Requires-Dist: pydantic>=2.0
+Requires-Dist: SimpleITK>=2.3
+Requires-Dist: pandas>=2.0
+Requires-Dist: scikit-learn>=1.3
+Requires-Dist: scipy>=1.10
+Requires-Dist: joblib>=1.3
+Requires-Dist: optuna>=3.0
+Requires-Dist: tqdm>=4.66
+Requires-Dist: torch>=2.0
+Requires-Dist: lightgbm>=4.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+
+# ScatterRad
+
+ScatterRad is a texture-classification framework for nnUNet-style medical imaging datasets.
+
+## Quickstart
+
+```bash
+conda activate scatterrad
+pip install -e ".[dev]"
+scatterrad validate Dataset002_LesionDetection
+```
+
+Set required environment variables before using the CLI:
+
+- `SCATTERRAD_RAW`
+- `SCATTERRAD_PREPROCESSED`
+- `SCATTERRAD_RESULTS`
