@@ -164,7 +164,8 @@ class ScatterRadDataset(Dataset):
                 if mask_tensor is None:
                     mask_tensor = self._load_mask_tensor(basename, label_id, scatter_tensor.device)
             if self.augment:
-                scatter_tensor, mask_tensor = self._augment_cached_sample(scatter_tensor, mask_tensor)
+                aug_params = self._sample_aug_params()
+                scatter_tensor, mask_tensor = self._apply_aug_params(scatter_tensor, mask_tensor, aug_params)
             target_value = self.case_targets[basename].get_per_label(self.task.target, label_id)
             item = {
                 "scatter": scatter_tensor,
@@ -180,6 +181,7 @@ class ScatterRadDataset(Dataset):
         scatters = []
         masks = []
         present = []
+        aug_params = self._sample_aug_params() if self.augment else None
         for label_id in self.labels:
             variant_idx = self._sample_variant_idx()
             key = (basename, int(label_id))
@@ -205,8 +207,8 @@ class ScatterRadDataset(Dataset):
                 if mask_tensor is None:
                     mask_tensor = self._load_mask_tensor(basename, label_id, scatter_tensor.device)
 
-            if self.augment:
-                scatter_tensor, mask_tensor = self._augment_cached_sample(scatter_tensor, mask_tensor)
+            if aug_params is not None:
+                scatter_tensor, mask_tensor = self._apply_aug_params(scatter_tensor, mask_tensor, aug_params)
 
             scatters.append(scatter_tensor)
             if self._need_cache_mask:
@@ -233,31 +235,27 @@ class ScatterRadDataset(Dataset):
             item["masks"] = torch.stack(filled_masks, dim=0).float()
         return item
 
-    def _augment_cached_sample(
+    def _sample_aug_params(self) -> dict:
+        """Sample augmentation parameters once; apply consistently across all labels."""
+        do_shift = self._rng.random() < 0.5
+        shifts = [int(v) for v in self._rng.integers(-2, 3, size=3)] if do_shift else None
+        return {"shifts": shifts}
+
+    def _apply_aug_params(
         self,
         scatter: torch.Tensor,
         mask: torch.Tensor | None,
+        params: dict,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Lightweight augmentation for cached filter-bank tensors.
-
-        Works with scatter shape (C,D,H,W). Applies random flips and small integer shifts.
-        """
+        """Apply pre-sampled augmentation parameters to a (C,D,H,W) scatter tensor."""
         s = scatter
         m = mask
-        # Random flips along spatial axes.
-        for axis in (-3, -2, -1):
-            if self._rng.random() < 0.5:
-                s = torch.flip(s, dims=(axis,))
-                if m is not None:
-                    m = torch.flip(m, dims=(axis,))
 
-        # Random small translation.
-        if self._rng.random() < 0.5:
-            shifts = [int(v) for v in self._rng.integers(-2, 3, size=3)]
+        if params["shifts"] is not None:
+            shifts = params["shifts"]
             s = torch.roll(s, shifts=tuple(shifts), dims=(-3, -2, -1))
             if m is not None:
                 m = torch.roll(m, shifts=tuple(shifts), dims=(-3, -2, -1))
-            # Zero-fill wrapped regions after roll.
             dz, dy, dx = shifts
             if dz > 0:
                 s[..., :dz, :, :] = 0

@@ -733,6 +733,7 @@ def train(
         scaler = amp.GradScaler("cuda", enabled=amp_enabled)
         start_epoch = 0
         best_metric = -float("inf")
+        best_val_loss = float("inf")
         best_state: dict[str, torch.Tensor] | None = None
         best_epoch = 0
         epochs_without_improvement = 0
@@ -769,6 +770,11 @@ def train(
                         best_metric = float(payload["best_metric"])
                     except (TypeError, ValueError):
                         best_metric = -float("inf")
+                if "best_val_loss" in payload:
+                    try:
+                        best_val_loss = float(payload["best_val_loss"])
+                    except (TypeError, ValueError):
+                        best_val_loss = float("inf")
                 if "best_epoch" in payload:
                     try:
                         best_epoch = int(payload["best_epoch"])
@@ -922,6 +928,10 @@ def train(
                 best_metric = score
                 best_epoch = epoch
                 best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+
+            current_val_loss = float(eval_result["mean_loss"])
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
@@ -966,6 +976,7 @@ def train(
                 "last_epoch": last_epoch,
                 "best_epoch": best_epoch,
                 "best_metric": float(best_metric),
+                "best_val_loss": float(best_val_loss),
                 "task": task.name,
             },
             result_dir / "checkpoint.pt",

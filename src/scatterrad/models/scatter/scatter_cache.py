@@ -18,6 +18,23 @@ from scatterrad.preprocessing.crop import read_crop
 _CACHE_STEM_RE = re.compile(r"^(?P<basename>.+)_label(?P<label_id>\d{3})(?:_aug(?P<variant>\d{3}))?$")
 
 
+def _center_crop_or_pad(volume: np.ndarray, shape: tuple[int, int, int], order: int) -> np.ndarray:
+    out = np.zeros(shape, dtype=volume.dtype)
+    src_slices = []
+    dst_slices = []
+    for dim, target in zip(volume.shape, shape):
+        if dim >= target:
+            start = (dim - target) // 2
+            src_slices.append(slice(start, start + target))
+            dst_slices.append(slice(0, target))
+        else:
+            pad = (target - dim) // 2
+            src_slices.append(slice(0, dim))
+            dst_slices.append(slice(pad, pad + dim))
+    out[tuple(dst_slices)] = volume[tuple(src_slices)]
+    return out
+
+
 def _augment_crop_for_cache(
     image: np.ndarray,
     mask: np.ndarray,
@@ -32,6 +49,27 @@ def _augment_crop_for_cache(
     x = image.astype(np.float32, copy=True)
     m = mask.astype(np.uint8, copy=True)
 
+    # --- Geometric augmentations (applied to raw image before filter-bank computation) ---
+
+    # Random rotation (one axis-pair, ±10°).
+    if rng.random() < 0.5:
+        axes_options = [(0, 1), (0, 2), (1, 2)]
+        axes = axes_options[int(rng.integers(0, len(axes_options)))]
+        angle = float(rng.uniform(-10.0, 10.0))
+        x = ndimage.rotate(x, angle=angle, axes=axes, reshape=False, order=3, mode="nearest")
+        m = ndimage.rotate(m, angle=angle, axes=axes, reshape=False, order=0, mode="nearest")
+
+    # Random isotropic zoom (±5%), re-centred to original size.
+    if rng.random() < 0.5:
+        orig_shape = x.shape
+        scale = float(rng.uniform(0.95, 1.05))
+        x = ndimage.zoom(x, zoom=scale, order=3)
+        m = ndimage.zoom(m, zoom=scale, order=0)
+        x = _center_crop_or_pad(x, orig_shape, order=3)
+        m = _center_crop_or_pad(m, orig_shape, order=0)
+
+    # --- Intensity augmentations ---
+
     scale = float(rng.uniform(1.0 - intensity_scale_delta, 1.0 + intensity_scale_delta))
     shift = float(rng.uniform(-intensity_shift_delta, intensity_shift_delta))
     x = x * scale + shift
@@ -40,6 +78,8 @@ def _augment_crop_for_cache(
         sigma = float(rng.uniform(0.0, noise_std))
         if sigma > 0:
             x = x + rng.normal(loc=0.0, scale=sigma, size=x.shape).astype(np.float32)
+
+    # --- Elastic deformation ---
 
     if elastic_alpha > 0 and elastic_sigma > 0:
         shape = x.shape
