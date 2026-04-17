@@ -257,6 +257,14 @@ def cmd_train(args: argparse.Namespace) -> int:
             model_config={},
         )
         logging.getLogger(__name__).info("Auto-generated task name: %s", task.name)
+
+    if task.model is ModelKind.SCATTER:
+        if bool(args.debug):
+            task.model_config["debug"] = True
+        if args.debug_every is not None:
+            task.model_config["debug_save_every_n_epochs"] = int(args.debug_every)
+        if args.debug_cases is not None:
+            task.model_config["debug_num_cases"] = int(args.debug_cases)
     plans = PlansConfig.from_json(paths.plans_json)
 
     if task.model is ModelKind.RADIOMICS:
@@ -463,6 +471,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("-c", "--continue", dest="cont", action="store_true")
     p_train.add_argument("--resume-from", type=Path, default=None)
     p_train.add_argument("--gpu", type=int, default=None)
+    p_train.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Scatter model: save debug input-feature and attention panels to fold/debug/.",
+    )
+    p_train.add_argument(
+        "--debug-every",
+        type=int,
+        default=None,
+        help="Scatter model: save debug panels every N epochs.",
+    )
+    p_train.add_argument(
+        "--debug-cases",
+        type=int,
+        default=None,
+        help="Scatter model: number of validation cases to render per debug save.",
+    )
     p_train.set_defaults(func=cmd_train)
 
     p_summary = sub.add_parser("summary", help="Print mean±std CV metrics across folds")

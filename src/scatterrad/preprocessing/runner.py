@@ -85,7 +85,7 @@ def _preprocess_case(
     intensity_std: float | None,
     label_ids: tuple[int, ...],
     crop_paths: tuple[str, ...],
-) -> tuple[bool, bool, list[tuple[int, tuple]]]:
+) -> tuple[bool, bool]:
     image = sitk.ReadImage(image_path)
     label = sitk.ReadImage(label_path)
 
@@ -117,10 +117,11 @@ def _preprocess_case(
     x_norm = normalize(x, fg, plans_case)
 
     spacing_zyx = tuple(float(v) for v in reversed(image_rs.GetSpacing()))
-    margins = _margin_voxels(crop_margin_mm, spacing_zyx)
+    # Tight crops only: no additional margin around bbox.
+    _ = crop_margin_mm
+    margins = (0, 0, 0)
     found_foreground = False
     wrote_any = False
-    clipped_labels: list[tuple[int, tuple]] = []
     for label_id, crop_path_str in zip(label_ids, crop_paths):
         bbox = bbox_from_label(y, label_id)
         if bbox is None:
@@ -128,33 +129,25 @@ def _preprocess_case(
         found_foreground = True
         crop_file = Path(crop_path_str)
         if crop_file.exists():
-            try:
-                with np.load(crop_file, allow_pickle=False) as payload:
-                    cached_shape = tuple(int(v) for v in payload["image"].shape)
-                if cached_shape == tuple(int(v) for v in crop_size_voxels):
-                    continue
-            except Exception:
-                pass
+            continue
         mask = (y == label_id).astype(np.uint8)
-        crop_img, crop_msk, clipped = crop_around_bbox(
+        crop_img, crop_msk = crop_around_bbox(
             x_norm,
             mask,
             bbox=bbox,
-            target_size=crop_size_voxels,
             margin_voxels=margins,
         )
-        if clipped:
-            bbox_size = tuple(bbox[i].stop - bbox[i].start for i in range(3))
-            clipped_labels.append((int(label_id), bbox_size))
         meta = {
             "basename": basename,
             "label_id": int(label_id),
             "original_spacing_mm": spacing_zyx,
             "bbox_voxels": [(s.start, s.stop) for s in bbox],
+            "crop_shape_zyx": tuple(int(v) for v in crop_img.shape),
         }
         write_crop(crop_file, crop_img, crop_msk, meta)
         wrote_any = True
-    return found_foreground, wrote_any, clipped_labels
+    _ = crop_size_voxels
+    return found_foreground, wrote_any
 
 
 def _planned_cache_modes(planner_name: str | None) -> tuple[bool, bool]:
@@ -198,6 +191,15 @@ def preprocess(paths: ScatterRadPaths, num_workers: int = 0) -> None:
     schema = load_targets_schema(paths.targets_json)
     basenames = _case_basenames(paths.images_tr)
     paths.ensure_preprocessed()
+    # No backward compatibility mode: regenerate preprocessing artifacts fresh.
+    for stale in paths.crops_dir.glob("*.npz"):
+        stale.unlink()
+    for stale in paths.radiomics_dir.glob("*.json"):
+        stale.unlink()
+    scatter_cache_dir = paths.preprocessed_dataset_dir / "scatter_cache"
+    if scatter_cache_dir.exists():
+        for stale in scatter_cache_dir.glob("*.npy"):
+            stale.unlink()
 
     raw_target_payloads: dict[str, dict[str, Any]] = {}
     for basename in basenames:
@@ -268,14 +270,9 @@ def preprocess(paths: ScatterRadPaths, num_workers: int = 0) -> None:
     workers = resolve_num_workers(num_workers, max_tasks=len(case_args))
     case_flags = _run_parallel_cases(_preprocess_case, case_args, workers=workers, desc="preprocess")
 
-    for basename, (found_foreground, _wrote_any, clipped_labels) in zip(basenames, case_flags):
+    for basename, (found_foreground, _wrote_any) in zip(basenames, case_flags):
         if not found_foreground:
             log.warning("No foreground labels for case %s", basename)
-        for label_id, bbox_size in clipped_labels:
-            log.warning(
-                "Crop clipped for case %s label %d: bbox %s exceeds target %s",
-                basename, label_id, bbox_size, tuple(plans.crop_size_voxels),
-            )
 
     first_cls = None
     for name, spec in schema.items():
@@ -337,14 +334,14 @@ def preprocess(paths: ScatterRadPaths, num_workers: int = 0) -> None:
         except Exception as exc:
             log.warning("Radiomics intercorrelation analysis skipped: %s", exc)
     if do_scatter:
-        from scatterrad.models.scatter.frontend import ScatterFrontend
+        from scatterrad.models.scatter.frontend import WaveletFrontend
         from scatterrad.models.scatter.scatter_cache import precompute_and_cache
 
         log.info("Plan requests scatter preprocessing; precomputing scattering cache.")
-        frontend = ScatterFrontend(
+        frontend = WaveletFrontend(
             crop_size=tuple(plans.crop_size_voxels),
-            J=2,
-            L=2,
+            spacing_mm=tuple(plans.target_spacing_mm),
+            level=1,
             mask_mode="zero",
         )
         precompute_and_cache(paths=paths, frontend=frontend, device="cpu")

@@ -157,7 +157,9 @@ def plan(paths: ScatterRadPaths, num_workers: int = 0, planner: str | None = "al
             "p95": tuple(int(x) for x in p95_vox),
         }
 
-    # Use a robust percentile over resampled bbox sizes for fixed crop sizing.
+    # Compute a reference crop size from robust bbox statistics.
+    # NOTE: preprocessing now writes tight variable-size crops; this reference
+    # size is kept for planning metadata and fallback paths only.
     label_paths = [str(paths.labels_tr / f"{b}.nii.gz") for b in basenames]
     bbox_case_args = [
         (label_path, target_spacing, tuple(ds.label_ids)) for label_path in label_paths
@@ -165,8 +167,7 @@ def plan(paths: ScatterRadPaths, num_workers: int = 0, planner: str | None = "al
     bbox_maps = _run_parallel_cases(
         _resampled_bbox_case, bbox_case_args, workers=workers, desc="bbox-pass"
     )
-    # Compute per-label bbox distributions, then take the median-label p95 as crop size.
-    # This avoids inflating crop size to the largest outlier label across the whole dataset.
+    # Robust global bbox percentile to summarize a typical crop envelope.
     all_bbox_vox: list[np.ndarray] = []
     for bbox_map in bbox_maps:
         for bbox in bbox_map.values():
@@ -181,11 +182,11 @@ def plan(paths: ScatterRadPaths, num_workers: int = 0, planner: str | None = "al
         bbox_size_vox = np.asarray([64, 64, 64], dtype=int)
         max_bbox_vox = np.asarray([64, 64, 64], dtype=int)
 
-    margin_mm = 10.0
+    margin_mm = 0.0
     margin_vox = np.ceil(margin_mm / np.asarray(target_spacing)).astype(int)
     crop_size = tuple(max(32, _next_multiple(int(v), 8)) for v in bbox_size_vox + (2 * margin_vox))
     log.info(
-        "Crop size from p99 bbox + margin: p99_bbox=%s margin_vox=%s crop=%s",
+        "Reference crop size (metadata only) from p99 bbox + margin: p99_bbox=%s margin_vox=%s crop=%s",
         tuple(int(v) for v in bbox_size_vox),
         tuple(int(v) for v in margin_vox),
         crop_size,

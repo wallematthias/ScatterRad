@@ -15,6 +15,7 @@ from scatterrad.preprocessing.crop import read_crop
 
 
 def _cache_key(frontend: ScatterFrontend) -> str:
+    cache_dtype = os.environ.get("SCATTERRAD_SCATTER_CACHE_DTYPE", "float16").strip().lower()
     payload = {
         "wavelet": getattr(frontend, "wavelet", None),
         "level": getattr(frontend, "level", None),
@@ -24,6 +25,7 @@ def _cache_key(frontend: ScatterFrontend) -> str:
         "crop_size": frontend.crop_size,
         "log_sigmas_mm": getattr(frontend, "log_sigmas_mm", None),
         "use_gradient": getattr(frontend, "use_gradient", None),
+        "cache_dtype": cache_dtype,
     }
     blob = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:8]
@@ -37,8 +39,8 @@ def _cache_dir(paths: ScatterRadPaths, frontend: ScatterFrontend) -> Path:
 def _process_one(
     crop_path: str,
     out_path: str,
-    expected_shape: tuple,
     frontend_kwargs: dict,
+    out_dtype_str: str,
 ) -> str:
     """Worker: compute filter-bank features for one crop and save to .npy.
 
@@ -51,19 +53,13 @@ def _process_one(
     import torch
 
     image, mask, _ = read_crop(Path(crop_path))
-    if tuple(int(v) for v in image.shape) != tuple(expected_shape):
-        raise RuntimeError(
-            f"Crop shape mismatch for {Path(crop_path).name}: "
-            f"got {tuple(image.shape)}, expected {tuple(expected_shape)}. "
-            "Rerun `scatterrad preprocess` to regenerate stale crops."
-        )
-
     fe = WaveletFrontend(**frontend_kwargs)
     x = torch.from_numpy(image[None, None, ...]).float()
     m = torch.from_numpy(mask[None, None, ...]).float()
     with torch.no_grad():
         out, _ = fe(x, m)
-    np.save(out_path, out.squeeze(0).numpy().astype(np.float32))
+    out_dtype = np.float16 if out_dtype_str == "float16" else np.float32
+    np.save(out_path, out.squeeze(0).numpy().astype(out_dtype, copy=False))
     return Path(crop_path).stem
 
 
@@ -105,8 +101,16 @@ def precompute_and_cache(
 
     num_workers = int(os.environ.get("SCATTERRAD_NP", 0)) or os.cpu_count() or 1
 
+    out_dtype_str = os.environ.get("SCATTERRAD_SCATTER_CACHE_DTYPE", "float16").strip().lower()
+    if out_dtype_str not in {"float16", "float32"}:
+        out_dtype_str = "float16"
     args_list = [
-        (str(p), str(cdir / f"{p.stem}.npy"), tuple(frontend.crop_size), frontend_kwargs)
+        (
+            str(p),
+            str(cdir / f"{p.stem}.npy"),
+            frontend_kwargs,
+            out_dtype_str,
+        )
         for p in pending
     ]
 
@@ -128,4 +132,5 @@ def load_cached_scatter(paths: ScatterRadPaths, basename: str, label_id: int) ->
     cache_file = paths.preprocessed_dataset_dir / "scatter_cache" / f"{basename}_label{label_id:03d}.npy"
     if not cache_file.exists():
         return None
-    return np.load(cache_file).astype(np.float32)
+    arr = np.load(cache_file, mmap_mode="r")
+    return np.asarray(arr, dtype=np.float32)
